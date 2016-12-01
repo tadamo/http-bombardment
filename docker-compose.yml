@@ -1,0 +1,7 @@
+version: '2'
+services:
+  http-bombardment:
+    image: tadamo/http-bombardment
+    build:
+      context: .
+    container_name: http-bombardment
