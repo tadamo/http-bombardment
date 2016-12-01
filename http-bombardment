@@ -1,0 +1,227 @@
+#!/usr/bin/env perl
+use Mojo::Base -strict;
+use Mojo::IOLoop;
+use Mojo::UserAgent;
+use Getopt::Long;
+use Benchmark::Timer;
+use Term::ANSIColor;
+use IO::Interactive qw/is_interactive/;
+use English;
+use Math::NumberCruncher;
+use Term::Size;
+use utf8;
+use File::Slurp;
+use Data::GUID;
+
+#use Text::Unidecode;
+$OUTPUT_AUTOFLUSH = 1;
+$ENV{ANSI_COLORS_DISABLED} = 1 if not is_interactive;
+
+###############################################################################
+###############################################################################
+my $vb = colored( ['white on_black'], '|' );
+
+###############################################################################
+###############################################################################
+my $verbose;
+my $url_file = '';
+my $url_per  = 'call';
+my $method   = 'get';
+my $output;
+my $concurrent       = 1;
+my $rounds           = 1;
+my $follow_redirects = 1;
+my $keep_alive;
+my $basic_auth;
+GetOptions(
+    "file=s"             => \$url_file,
+    "url_per=s"          => \$url_per,
+    "output"             => \$output,
+    "verbose"            => \$verbose,
+    "concurrent=i"       => \$concurrent,
+    "rounds=i"           => \$rounds,
+    "method=s"           => \$method,
+    "follow_redirects=i" => \$follow_redirects,
+    "keep_alive=i"       => \$keep_alive,
+    "basic_auth=s"       => \$basic_auth,
+) or die "Error in command line arguments\n";
+die "No URL given." if not( exists $ARGV[0] or $url_file );
+die "url_per must be one of `call` or `round`"
+    if $url_per and not( $url_per eq 'call' or $url_per eq 'round' );
+###############################################################################
+###############################################################################
+
+my $url = Mojo::URL->new( $ARGV[0] )->userinfo($basic_auth) if $ARGV[0];
+my @urls = map { Mojo::URL->new($_)->userinfo($basic_auth) } split /\n/,
+    read_file($url_file)
+    if $url_file;
+my $ua = Mojo::UserAgent->new();
+$ua->max_connections($keep_alive) if $keep_alive;
+$ua->max_redirects($follow_redirects);
+my $round_counter   = 0;
+my %status_counter  = ( total => 0, success => 0, fail => 0, );
+my $benchmark_timer = Benchmark::Timer->new();
+$ua->on(
+    start => sub {
+        my ( $ua, $tx ) = @_;
+        $tx->on(
+            connection => sub {
+                my ($tx) = @_;
+                $tx->{uuid} = Data::GUID->new()->as_string();
+                $benchmark_timer->start( $tx->{uuid} );
+                return;
+            }
+        );
+
+        $tx->on(
+            finish => sub {
+                my ($tx) = @_;
+                if ( $tx->success() or exists $tx->error()->{code} ) {
+                    $benchmark_timer->stop( $tx->{uuid} );
+                }
+                return;
+            }
+        );
+
+        return;
+    }
+);
+
+###############################################################################
+###############################################################################
+###############################################################################
+
+# Create steps.
+my @steps = (
+    sub {
+        my $delay = shift;
+        $url = next_url() if $url_file and $url_per eq 'round';
+        for ( 1 .. $concurrent ) {
+            $url = next_url() if $url_file and $url_per eq 'call';
+            $ua->$method( $url => $delay->begin() );
+        }
+        return;
+    },
+    sub {
+        my ( $delay, @txs ) = @_;
+        print spacer_for_report( sprintf 'ROUND %s', ++$round_counter ) . "\n";
+        for my $tx (@txs) {
+            $status_counter{total}++;
+            if ( $tx->error() ) {
+                $status_counter{fail}++;
+            }
+            else {
+                $status_counter{success}++;
+            }
+
+            my $log_url = $tx->req()->url()->clone();
+            $log_url->userinfo('');
+            printf "$vb %s $vb %s $vb %s $vb %s $vb %s $vb\n",
+                code_for_report( $tx->res()->code() ),    #
+                time_for_report( $benchmark_timer->result( $tx->{uuid} ) ),
+                $tx->req()->method(),                     #
+                url_for_report( $tx->req()->url() ),      #
+                res_for_report( $tx->res() ),             #
+        }
+
+        #delay->remaining() is an array ref of the remaining subs
+        if ( @{ $delay->remaining() } ) {
+            $delay->pass();
+        }
+        return;
+    },
+);
+
+# Create rounds (steps)
+my @rounds = map {@steps} ( 1 .. $rounds );
+
+###############################################################################
+###############################################################################
+###############################################################################
+Mojo::IOLoop->delay(@rounds)->wait();
+print_report( $benchmark_timer, \%status_counter );
+###############################################################################
+###############################################################################
+###############################################################################
+
+#shift off the next url, and put it back in the queue. return that url
+sub next_url {
+    my $u = shift @urls;
+    push @urls, $u;
+    return $u;
+}
+
+sub code_for_report {
+    my $code = shift;
+    return colored( ['magenta'], 'N/A' ) if not $code;
+    my $color
+        = ( $code >= 500 ) ? 'red'
+        : ( $code >= 400 ) ? 'blue'
+        : ( $code >= 200 ) ? 'green'
+        :                    'reset';
+    return colored( [$color], $code );
+}
+
+sub time_for_report {
+    my $time = shift;
+    return 'N/A ' if not $time;
+    my $secs = sprintf '%.3f', $time;
+    my $color
+        = ( $secs >= 2 ) ? 'red'
+        : ( $secs >= 1 )  ? 'magenta'
+        : ( $secs >= .5 ) ? 'blue'
+        :                   'green';
+    return colored( [$color], $secs );
+}
+
+sub url_for_report {
+    my $url = shift;
+    return $url->clone()->userinfo(undef)->to_string();
+}
+
+sub res_for_report {
+    my $res = shift;
+    my $content_type = ( $res->headers()->content_type() // '' );
+    return sprintf '%s - %s', $content_type, ( $output ? $res->body() : '' );
+}
+
+sub spacer_for_report {
+    my $spacer_title = shift // '';
+    my ( $columns, $rows ) = Term::Size::chars * STDOUT {IO};
+    $columns = 78 if not $columns;    #in case screen size not readable
+    return $spacer_title if length $spacer_title > $columns;    #can't help you
+    my $string_length    = length($spacer_title) + 2; #+2 for space on each side
+    my $seperator_length = $columns - $string_length;
+    $seperator_length -= 1
+        if $seperator_length % 2 != 0;                #OCD even on both sides
+    $seperator_length /= 2;
+    my $seperator = '=' x $seperator_length;
+    return sprintf '%s %s %s', $seperator, $spacer_title, $seperator;
+}
+
+sub print_report {
+    my $timer = shift;
+
+    #get times from results
+    my %results = $timer->results();
+    my @times = map { $results{$_} } keys %results;
+    print colored( ['yellow'], spacer_for_report('=') ) . "\n";
+    print colored( ['yellow'], spacer_for_report('Final Report') ) . "\n";
+    print colored( ['yellow'], spacer_for_report('=') ) . "\n";
+    printf "Total Requests           : %s \n", $status_counter{total};
+    printf "Successful Requests      : %s \n", $status_counter{success};
+    printf "Failed Requests          : %s \n",
+        (
+        $status_counter{fail} == 0
+        ? colored( ['green'], $status_counter{fail} )
+        : colored( ['red'],   $status_counter{fail} )
+        );
+    printf "Concurrent Requests      : %s \n", $concurrent;
+    printf "Number of Rounds         : %s \n", $rounds;
+    printf "Average Time per Request : %s \n",
+        time_for_report( Math::NumberCruncher::Mean( \@times ) );
+    printf "Response Time Variance   : %s \n",
+        Math::NumberCruncher::Variance( \@times, 5 );
+    printf "Response Time Std Dev    : %s \n",
+        Math::NumberCruncher::StandardDeviation( \@times, 5 );
+}
